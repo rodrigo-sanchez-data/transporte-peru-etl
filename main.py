@@ -9,10 +9,10 @@ from config import (
 )
 from src.extract import extract_excel, extract_csv
 from src.transform import (
-    estandarizar_columnas, agrupar_departamentos, normalizar_departamentos, limpiar_texto, convertir_tipos_siniestros,
-    filtrar_nulos_criticos, imputar_nulos_siniestros, generar_id_departamento, asignar_id_departamento, convertir_tipos_personas,
+    estandarizar_columnas, agrupar_columna, normalizar_columna, limpiar_texto, convertir_tipos_siniestros,
+    filtrar_nulos_criticos, imputar_nulos_siniestros, generar_id_columna, asignar_id_departamento, convertir_tipos_personas,
     imputar_nulos_personas, imputar_nulos_vehiculos, convertir_tipos_vehiculos, resumen_pipeline, filtrar_huerfanos,
-    eliminar_duplicados_personas
+    eliminar_duplicados_personas, asignar_id_distrito, asignar_id_provincia, corregir_nasca
 )
 from src.load import load_to_postgres, crear_esquema, truncar_tablas
 
@@ -27,17 +27,36 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-def preparar_departamentos(df: pd.DataFrame) -> pd.DataFrame:
-    logger.info("[PIPELINE] Iniciando preparación de la tabla departamentos...")
+def preparar_distritos(df: pd.DataFrame) -> pd.DataFrame:
+    logger.info("[PIPELINE] Iniciando preparación de la tabla distritos...")
     df = df.copy()
-    df_departamento_clean = (
+    df_distritos_clean = (
         df
         .pipe(estandarizar_columnas)
-        .pipe(normalizar_departamentos)
-        .pipe(agrupar_departamentos)
-        .pipe(generar_id_departamento)
+        .pipe(normalizar_columna, lista_columnas=["departamento", "provincia", "distrito"])
+        .pipe(corregir_nasca)
+        .pipe(agrupar_columna, lista_columnas=["departamento", "provincia", "distrito"])
+        .pipe(generar_id_columna, columna = "id_distrito")
     )
-    return df_departamento_clean
+    return df_distritos_clean
+
+def preparar_provincias(df_distritos: pd.DataFrame) -> pd.DataFrame:
+    logger.info("[PIPELINE] Iniciando preparación de la tabla provincias...")
+    df_provincias_clean = (
+        df_distritos
+        .pipe(agrupar_columna, lista_columnas=["departamento", "provincia"])
+        .pipe(generar_id_columna, columna = "id_provincia")
+    )
+    return df_provincias_clean
+
+def preparar_departamentos(df_provincias: pd.DataFrame) -> pd.DataFrame:
+    logger.info("[PIPELINE] Iniciando preparación de la tabla departamentos...")
+    df_departamentos_clean = (
+        df_provincias
+        .pipe(agrupar_columna, lista_columnas=["departamento"])
+        .pipe(generar_id_columna, columna = "id_departamento")
+    )
+    return df_departamentos_clean
 
 def preparar_siniestros(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("[PIPELINE] Iniciando preparación de la tabla siniestros...")
@@ -46,7 +65,7 @@ def preparar_siniestros(df: pd.DataFrame) -> pd.DataFrame:
         df
         .pipe(estandarizar_columnas)
         .pipe(limpiar_texto)
-        .pipe(normalizar_departamentos)
+        .pipe(normalizar_columna, lista_columnas=["departamento", "provincia", "distrito"])
         .pipe(convertir_tipos_siniestros)
         .pipe(filtrar_nulos_criticos, CAMPOS_CRITICOS_SINIESTROS)
         .pipe(imputar_nulos_siniestros)
@@ -92,8 +111,12 @@ def ejecutar_pipeline() -> None:
 
     # Transform
     n_pob_in = len(df_poblacion)
-    df_departamentos_clean = preparar_departamentos(df_poblacion)
-    resultados["departamentos"] = {"entrada": n_pob_in, "salida": len(df_departamentos_clean)}
+    df_distritos_clean = preparar_distritos(df_poblacion)
+    df_provincias_clean = preparar_provincias(df_distritos_clean)
+    df_departamentos_clean = preparar_departamentos(df_provincias_clean)
+    resultados["distritos"] = {"entrada": n_pob_in, "salida": len(df_distritos_clean)}
+    resultados["provincias"] = {"entrada": len(df_distritos_clean), "salida": len(df_provincias_clean)}
+    resultados["departamentos"] = {"entrada": len(df_provincias_clean), "salida": len(df_departamentos_clean)}
 
     n_sin_in = len(df_siniestros)
     df_siniestros_clean = preparar_siniestros(df_siniestros)
@@ -107,11 +130,16 @@ def ejecutar_pipeline() -> None:
     df_vehiculos_clean = preparar_vehiculos(df_vehiculos)
     resultados["vehiculos"] = {"entrada": n_veh_in, "salida": len(df_vehiculos_clean)}
 
-    df_siniestros_clean = asignar_id_departamento(df_siniestros_clean, df_departamentos_clean)
-    df_personas_clean = filtrar_huerfanos(df_personas_clean, df_siniestros_clean, "c_digo_siniestro", "c_digo_siniestro")
-    df_vehiculos_clean = filtrar_huerfanos(df_vehiculos_clean, df_siniestros_clean, "c_digo_siniestro", "c_digo_siniestro")
+    df_provincias_clean = asignar_id_departamento(df_provincias_clean, df_departamentos_clean)
+    df_distritos_clean = asignar_id_provincia(df_distritos_clean, df_provincias_clean)
+    df_siniestros_clean = asignar_id_distrito(df_siniestros_clean, df_distritos_clean)
 
-    # actualiza el resumen con los conteos finales, post-huérfanos
+    df_provincias_clean = df_provincias_clean.drop(columns=["departamento"])
+    df_distritos_clean = df_distritos_clean.drop(columns=["departamento", "provincia"])
+
+    df_personas_clean = filtrar_huerfanos(df_personas_clean, df_siniestros_clean, "codigo_siniestro", "codigo_siniestro")
+    df_vehiculos_clean = filtrar_huerfanos(df_vehiculos_clean, df_siniestros_clean, "codigo_siniestro", "codigo_siniestro")
+
     resultados["personas"]["salida"] = len(df_personas_clean)
     resultados["vehiculos"]["salida"] = len(df_vehiculos_clean)
 
@@ -121,9 +149,12 @@ def ejecutar_pipeline() -> None:
     truncar_tablas(conn_string)
 
     load_to_postgres(df_departamentos_clean, "departamentos", conn_string)
+    load_to_postgres(df_provincias_clean, "provincias", conn_string)
+    load_to_postgres(df_distritos_clean, "distritos", conn_string)
     load_to_postgres(df_siniestros_clean, "siniestros", conn_string)
     load_to_postgres(df_personas_clean, "personas", conn_string)
     load_to_postgres(df_vehiculos_clean, "vehiculos", conn_string)
+
 
     resumen_pipeline(resultados)
     logger.info("[PIPELINE] ==== Pipeline finalizado con éxito ====")

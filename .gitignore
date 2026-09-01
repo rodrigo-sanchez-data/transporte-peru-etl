@@ -6,7 +6,7 @@ __pycache__/
 *.pyd
 .env
 *.log
-etl_taxi.log
+etl_transporte.log
 data/raw/*
 data/processed/*
 !data/raw/.gitkeep
